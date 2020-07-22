@@ -1,0 +1,3 @@
+size_t: size of any object in bytes and returned by sizeof operator. It is used for array indexing and counting. It can never be negative. The return type of strcspn, strlen functions is size_t
+
+
