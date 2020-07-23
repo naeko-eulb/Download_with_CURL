@@ -13,3 +13,12 @@ As long as you're aware of these things, it should not be a problem to define _G
 In particular, the things from _GNU_SOURCE that you should never use are #2 and #4 above.
 
 https://stackoverflow.com/questions/9409997/how-to-resume-file-download-through-ftp-using-curl-in-c
+
+CMD:
+./download --url=http://courses.washington.edu/esrm590/data/esrm250_aut2004.iso.zip --thread=5 --conn=5 --out=esrm250_aut2004.iso.zip
+
+Compile:
+g++ download.cpp -lcurl -lpthread -o download
+
+# Understanding IDM work
+https://www.quora.com/How-do-I-make-my-own-downloader-like-IDM-using-C-Python-or-Java
