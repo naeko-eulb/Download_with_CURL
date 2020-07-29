@@ -8,23 +8,52 @@
 #ifndef WIN32
 #include <unistd.h>
 #endif
+#include <errno.h>
 
-#define NUMT 16				// Max thread
-#define MAX_MULTI_CONN 10	// Max connection in thread
+#define NUMT 16				// Max multi-thread
+#define MAX_MULTI_CONN 16	// Max connection in thread
+#define PART_FILE "-backup-"
+ 
+/* somewhat unix-specific */ 
+#include <sys/time.h>
+
+#ifndef CURLPIPE_MULTIPLEX
+/* This little trick will just make sure that we don't enable pipelining for
+   libcurls old enough to not have this symbol. It is _not_ defined to zero in
+   a recent libcurl header. */ 
+#define CURLPIPE_MULTIPLEX 0
+#endif
+
 using namespace std;
-
-struct link_argv
-{
-	char* url;
-	static int thread;
-	static int conn;
-	char* out;
-	char* range;
-	int number;
+struct transfer {
+    CURL *easy;
+    unsigned int num;
+    int position;
+    char *range;
+    FILE* fout; 
 };
 
-int link_argv::thread = 1;
-int link_argv::conn = 1;
+struct url_content
+{
+    char* url;
+    char* out;
+    curl_off_t content_len;
+    static int thread;
+    static int conn;
+    bool can_Resume;
+};
+
+int url_content::thread = 1;
+int url_content::conn = 1;
+
+struct url_content url_info;  /*Gobal variable keeps url, file_out and content length*/
+
+struct url_argv
+{
+  char* range;
+  int part;
+  int num;
+};
 
 static size_t write_data(void *ptr, size_t size, size_t nmemb, void *stream)
 {
@@ -32,7 +61,7 @@ static size_t write_data(void *ptr, size_t size, size_t nmemb, void *stream)
   return written;
 }
 
-void parse_argv(char* argv[], int argc, struct link_argv &handle)
+void parse_argv(char* argv[], int argc)
 {
 	for (int i = 1; i < argc; i++)
 	{
@@ -44,179 +73,373 @@ void parse_argv(char* argv[], int argc, struct link_argv &handle)
 		string content = part.substr(pos + 1);
 		if (header == "url")
 		{
-			handle.url = new char[content.length() + 1];
-			strcpy(handle.url, content.c_str());
+			url_info.url = new char[content.length() + 1];
+			strcpy(url_info.url, content.c_str());
 		}	
 		else if (header == "thread")
-			handle.thread = stoi(content);
+			url_info.thread = stoi(content);
 		else if (header == "conn")
-			handle.conn = stoi(content);
+			url_info.conn = stoi(content);
 		else if (header == "out")
 			{
-				handle.out = new char[content.length() + 1];
-				strcpy(handle.out, content.c_str());
+				url_info.out = new char[content.length() + 1];
+				strcpy(url_info.out, content.c_str());
 			}
 	}
 }
 
-// Set option and add easy interface to multi interface
-static void add_transfer(CURLM *cm, char* url, char* range,char* outfile, int start)
+static void setup(struct transfer *t, int num, int position, bool &success)
 {
+    FILE* file;
 
-  	CURL *eh = curl_easy_init();
-  	FILE* file = fopen(outfile, "wb");
-  	fseek(file, start, SEEK_SET);
+    /* open the file*/  
+    string path_out(url_info.out); 
+    std::size_t found = path_out.rfind(".");
+    std::string file_out = path_out.substr(0, found) + string(PART_FILE)+ to_string(url_info.thread) + to_string(url_info.conn) + to_string(position);
 
-  	curl_easy_setopt(eh, CURLOPT_URL, url);
-  	curl_easy_setopt(eh, CURLOPT_PRIVATE, url);
-
-  	/* Switch on full protocol/debug output while testing*/ 
-  	curl_easy_setopt(eh, CURLOPT_VERBOSE, 1L);
+    string temp(t->range);
+    size_t pos = temp.find("-");
+    long start = stol(temp.substr(0, pos));
+    if (url_info.can_Resume)
+    {
+        file = fopen(file_out.c_str(), "ab");
+        long res = ftell(file); // size downloaded
+        if (res != 0)
+        {
+            start = start + res;
+            long end = stol(temp.substr(pos+1));
+            
+            if (start > end)  // Done before
+            {
+                t->range = NULL;
+                printf("Done\n");
+                success = false;
+                return;
+            }
+            else
+            {
+                printf("Resume\n");
+                string temp = std::to_string(start)+'-'+std::to_string(end); 
+                t->range = new char[temp.length() + 1];
+                strcpy(t->range, temp.c_str());
+            }
+        }       
+    }
+    else 
+        file = fopen(file_out.c_str(), "wb");
+    t->fout = file;
+    CURL *hnd;
  
-   	/* Enable progress meter, set to 1L to disable it*/  
-  	curl_easy_setopt(eh, CURLOPT_NOPROGRESS, 0L);
- 	
-  	/* get the range */
-  	curl_easy_setopt(eh, CURLOPT_RANGE, range);
-
-  	//curl_easy_setopt(eh, CURLOPT_WRITEFUNCTION, write_data);
-  	curl_easy_setopt(eh, CURLOPT_WRITEFUNCTION, write_data);
-  	/* write the page body to this file handle*/ 
-    curl_easy_setopt(eh, CURLOPT_WRITEDATA, file);
+    hnd = t->easy = curl_easy_init();
  
-   	/* get it!*/ 
-   	curl_easy_perform(eh);
- 	
-   	/* close the header file*/ 
-   	fclose(file);
-  	curl_multi_add_handle(cm, eh);
+    if(!file) {
+        fprintf(stderr, "error: could not open file %s for writing: %s\n",
+            file_out.c_str(), strerror(errno));
+        exit(1);
+    }
+ 
+    /* set the same URL */ 
+    curl_easy_setopt(hnd, CURLOPT_URL, url_info.url);
+ 
+    /* please be verbose */ 
+    curl_easy_setopt(hnd, CURLOPT_VERBOSE, 1L);
+
+    /* Enable progress meter, set to 1L to disable it*/  
+    curl_easy_setopt(hnd, CURLOPT_NOPROGRESS, 0L);
+ 
+    /* get the range */
+    curl_easy_setopt(hnd, CURLOPT_RANGE, t->range);
+    delete[] t->range;
+    
+    /* write to this file */ 
+    curl_easy_setopt(hnd, CURLOPT_WRITEDATA, file);
+    success = true;
+    #if (CURLPIPE_MULTIPLEX > 0)
+    /* wait for pipe connection to confirm */ 
+    curl_easy_setopt(hnd, CURLOPT_PIPEWAIT, 1L);
+    #endif
 }
 
 static void *download_file(void *handle)
 {
-	// Convert void* to struct
-	struct link_argv *my_handle = (struct link_argv*) handle;
-	// Check thread have 1 connection
-	if ((*my_handle).number == 1)
-	{
-	CURL *curl_handle;
-  	FILE *file;
-  	CURLcode res;
-  	/* init the curl session */
-  	curl_handle = curl_easy_init();
-  	
-  	/* set URL to get here  */
-  	curl_easy_setopt(curl_handle, CURLOPT_URL, (*my_handle).url);
- 
-  	/* Switch on full protocol/debug output while testing*/ 
-  	curl_easy_setopt(curl_handle, CURLOPT_VERBOSE, 1L);
- 
-   	/* Enable progress meter, set to 1L to disable it*/  
-  	curl_easy_setopt(curl_handle, CURLOPT_NOPROGRESS, 0L);
- 	
-  	/* get the range */
-  	curl_easy_setopt(curl_handle, CURLOPT_RANGE, (*my_handle).range);
+    // Convert void* to struct
+    struct url_argv *my_handle = (struct url_argv*) handle;
+    // Check thread have 1 connection
+    if ((*my_handle).num == 1)
+    {
+        /* Find position*/
+        int i = url_info.conn - url_info.thread + (*my_handle).part;
+        CURL *curl_handle;
+        FILE *file;
+        CURLcode res;
+        /* init the curl session */
+        curl_handle = curl_easy_init();
 
-  	/* send all data to this function */ 
-  	curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, write_data);
-  	/* open the file*/  
-  	file = fopen((*my_handle).out, "wb");
+        /* set URL to get here  */
+        curl_easy_setopt(curl_handle, CURLOPT_URL, url_info.url);
 
-  	string temp((*my_handle).range);
-  	size_t pos = temp.find("-");
-  	long start = stol(temp.substr(0, pos));
-  	fseek(file, start, SEEK_SET);
-  	if(file) {
-    	/* write the page body to this file handle*/ 
-    	curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, file);
- 
-    	/* get it!*/ 
-    	curl_easy_perform(curl_handle);
- 		
-    	/* close the header file*/ 
-    	fclose(file);
+        /* Switch on full protocol/debug output while testing*/
+        curl_easy_setopt(curl_handle, CURLOPT_VERBOSE, 1L);
+
+        /* Enable progress meter, set to 1L to disable it*/  
+        curl_easy_setopt(curl_handle, CURLOPT_NOPROGRESS, 0L);
+
+        /* open the file*/  
+        string path_out(url_info.out); 
+        std::size_t found = path_out.rfind(".");
+        std::string file_out = path_out.substr(0, found) + string(PART_FILE) + to_string(url_info.thread) + to_string(url_info.conn) + to_string(i);
+
+        string temp((*my_handle).range);
+        size_t pos = temp.find("-");
+        long start = stol(temp.substr(0, pos));
+        if (url_info.can_Resume)
+        {
+            file = fopen(file_out.c_str(), "ab");
+            long res = ftell(file); // size downloaded
+            if (res != 0)
+            { 
+                start = start + res;
+                long end = stol(temp.substr(pos+1));
+                if (start > end) // Finished before
+                {
+                    printf("Done\n");
+                    curl_easy_cleanup(curl_handle);
+                    fclose(file);
+                    return NULL;
+                }
+                printf("Resume\n");
+                string temp = std::to_string(start)+'-'+std::to_string(end); 
+                (*my_handle).range = new char[temp.length() + 1];
+                strcpy((*my_handle).range, temp.c_str());
+            }       
+        }
+        else 
+            file = fopen(file_out.c_str(), "wb");
+
+        /* get the range */
+        curl_easy_setopt(curl_handle, CURLOPT_RANGE, (*my_handle).range);
+
+        /* send all data to this function */ 
+        curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, write_data);
+        if(file) {
+            /* write the page body to this file handle*/ 
+            curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, file); 
+
+            /* get it!*/ 
+            curl_easy_perform(curl_handle);
+
+            /* close the header file*/ 
+            fclose(file);
+        }
+        curl_easy_cleanup(curl_handle);
     }
- 	curl_easy_cleanup(curl_handle);
- 
-  	curl_global_cleanup();
-  	}
   	else // multi - interface
   	{
-  		CURLM *cm;
-  		CURLMsg *msg;
-  		unsigned int transfers = 0;
-  		int msgs_left = -1;
-  		int still_alive = 1;
- 
-  		curl_global_init(CURL_GLOBAL_ALL);
-  		cm = curl_multi_init();
- 		
- 		if ((*my_handle).number > MAX_MULTI_CONN)
- 			(*my_handle).number = MAX_MULTI_CONN;
-  		/* Limit the amount of simultaneous connections curl should allow: */ 
-  		curl_multi_setopt(cm, CURLMOPT_MAXCONNECTS , (long)(*my_handle).number);
+  		  CURLM *cm;
+  		  CURLMsg *msg;
+  		  unsigned int transfers = 0;
+  		  int msgs_left = -1;
+  		  int still_alive = 1;
+        int still_running = 0; /* keep number of running handles */ 
+        
+        struct transfer trans[MAX_MULTI_CONN];
+  		  cm = curl_multi_init();
+ 		   
+        if ((*my_handle).num > MAX_MULTI_CONN || (*my_handle).num < 1)
+            (*my_handle).num = 4;/* suitable default */ 
+        int count = (*my_handle).num;
+        /* Limit the amount of simultaneous connections curl should allow: */ 
+        curl_multi_setopt(cm, CURLMOPT_MAXCONNECTS , (long)(*my_handle).num);
 
-  		string temp((*my_handle).range);
-  		size_t pos = temp.find("-");
-  		long start = stol(temp.substr(0, pos));
-  		long end = stol(temp.substr(pos+1));
+        string temp((*my_handle).range);
+  		  size_t pos = temp.find("-");
+  		  long start = stol(temp.substr(0, pos));
+  		  long end = stol(temp.substr(pos+1));
 
-  		for(transfers = 0; transfers < (*my_handle).number; transfers++)
-    	{
-    		long src = start + (end - start) / (*my_handle).number * transfers;
-    		long dst = src + (end - start) / (*my_handle).number - 1;
-    		if (transfers == (*my_handle).number - 1)
-    			dst = end;
-    		string range = std::to_string(src)+'-'+std::to_string(dst); 
-  			char *range_transfers = new char[range.length() + 1];
-			strcpy(range_transfers, range.c_str());
-    		add_transfer(cm, (*my_handle).url, range_transfers, (*my_handle).out, src);
- 		}
-  		do {
-    		curl_multi_perform(cm, &still_alive);
- 			
-    		while((msg = curl_multi_info_read(cm, &msgs_left))) {
-      		if(msg->msg == CURLMSG_DONE) { // identifies a transfer that is done
-        		char *url;
-        		CURL *e = msg->easy_handle;
-        		curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &url);
-        		fprintf(stderr, "R: %d - %s <%s>\n",
-                msg->data.result, curl_easy_strerror(msg->data.result), url);
-        		curl_multi_remove_handle(cm, e);
-        		curl_easy_cleanup(e);
-      		}
-      		else {
-        		fprintf(stderr, "E: CURLMsg (%d)\n", msg->msg);
-      		}
-  		}
-    	if(still_alive)
-      		curl_multi_wait(cm, NULL, 0, 1000, NULL);
+        int minus = 0; /* Keep part done before*/
+
+  		  for(transfers = 0; transfers < count; transfers++)
+        {
+            int i;
+            if ((*my_handle).num == url_info.conn/url_info.thread)
+                i = url_info.conn - (*my_handle).num * (url_info.thread - (*my_handle).part) + transfers;
+            else 
+                i = (*my_handle).part * (*my_handle).num + transfers;
+    		    long src = start + (end - start + 1) / (*my_handle).num * transfers;
+    		    long dst = src + (end - start + 1) / (*my_handle).num - 1;
+    		    if (transfers == (*my_handle).num - 1)
+                dst = end;
+    		    string range = std::to_string(src)+'-'+std::to_string(dst); 
+            trans[transfers].range = new char[range.length() + 1];
+            strcpy(trans[transfers].range, range.c_str());
+            bool success;
+            setup(&trans[transfers], transfers, i, success);
+
+            /* add the individual transfer */ 
+            if (success)
+                curl_multi_add_handle(cm, trans[transfers].easy);
+            else  
+                minus++;
+        }
+        count -= minus;
+        curl_multi_setopt(cm, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
  
-  		} while(still_alive); //  set to zero (0) on the return of this function, there is no longer any transfers in progress.
+        /* we start some action by calling perform right away */ 
+        curl_multi_perform(cm, &still_running);
+        
+        while(still_running) {
+            struct timeval timeout;
+            int rc; /* select() return code */ 
+            CURLMcode mc; /* curl_multi_fdset() return code */ 
  
-  		curl_multi_cleanup(cm);
-  		curl_global_cleanup();
+            fd_set fdread;
+            fd_set fdwrite;
+            fd_set fdexcep;
+            int maxfd = -1;
  
+            long curl_timeo = -1;
+ 
+            FD_ZERO(&fdread);
+            FD_ZERO(&fdwrite);
+            FD_ZERO(&fdexcep);
+ 
+            /* set a suitable timeout to play around with */ 
+            timeout.tv_sec = 1;
+            timeout.tv_usec = 0;
+ 
+            curl_multi_timeout(cm, &curl_timeo);
+            if(curl_timeo >= 0) {
+                timeout.tv_sec = curl_timeo / 1000;
+            if(timeout.tv_sec > 1)
+                timeout.tv_sec = 1;
+            else
+                timeout.tv_usec = (curl_timeo % 1000) * 1000;
+        }
+ 
+        /* get file descriptors from the transfers */ 
+        mc = curl_multi_fdset(cm, &fdread, &fdwrite, &fdexcep, &maxfd);
+ 
+        if(mc != CURLM_OK) {
+            fprintf(stderr, "curl_multi_fdset() failed, code %d.\n", mc);
+            break;
+        }
+ 
+        /* On success the value of maxfd is guaranteed to be >= -1. We call
+        select(maxfd + 1, ...); specially in case of (maxfd == -1) there are
+        no fds ready yet so we call select(0, ...) --or Sleep() on Windows--
+        to sleep 100ms, which is the minimum suggested value in the
+        curl_multi_fdset() doc. */ 
+ 
+        if(maxfd == -1) {
+            #ifdef _WIN32
+            Sleep(100);
+            rc = 0;
+            #else
+                /* Portable sleep for platforms other than Windows. */ 
+                struct timeval wait = { 0, 100 * 1000 }; /* 100ms */ 
+                rc = select(0, NULL, NULL, NULL, &wait);
+            #endif
+        }
+        else {
+            /* Note that on some platforms 'timeout' may be modified by select().
+            If you need access to the original value save a copy beforehand. */ 
+            rc = select(maxfd + 1, &fdread, &fdwrite, &fdexcep, &timeout);
+        }
+ 
+        switch(rc) {
+            case -1:
+                /* select error */ 
+                break;
+            case 0:
+                default:
+                /* timeout or readable/writable sockets */ 
+                curl_multi_perform(cm, &still_running);
+                break;
+        }
+    }
+ 
+        for(int i = 0; i < count; i++) {
+            curl_multi_remove_handle(cm, trans[i].easy);
+            curl_easy_cleanup(trans[i].easy);
+        }
+        for (int i = 0 ; i < count;i++)
+            fclose(trans[i].fout);
+  		  curl_multi_cleanup(cm);
+  		  curl_global_cleanup();
   	}
   	return NULL;
 }
 
+bool support_Resume()
+{
+    CURL *curl;
+    CURLcode res;
+    /* init the curl session */
+    curl = curl_easy_init();
+    
+    /* set URL to get here  */
+    curl_easy_setopt(curl, CURLOPT_URL, url_info.url);
+ 
+    curl_easy_setopt(curl, CURLOPT_HEADER, 1);
+    curl_easy_setopt(curl, CURLOPT_NOBODY, 1);
+    curl_easy_setopt(curl, CURLOPT_RANGE, "0-1");
+  
+    curl_easy_perform(curl);  
+    long http_code = 0;
+    res = curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_easy_cleanup(curl);
+    return http_code == 206?1:0;
+}
+
+void connect_file()
+{
+    FILE *fw, *fr;
+    char c;
+    fw = fopen(url_info.out, "wb");
+    for (int i = 0; i < url_info.conn; i++)
+    { 
+        printf("Connect file %u", i);
+        /* open the file*/  
+        string path_out(url_info.out); 
+        std::size_t found = path_out.rfind(".");
+        std::string file_out = path_out.substr(0, found) + string(PART_FILE) + to_string(url_info.thread) + to_string(url_info.conn) + to_string(i);
+        fr = fopen(file_out.c_str(), "rb");
+        if (!fr)
+            break;
+        fseek(fr, 0L, SEEK_END);
+        long int res = ftell(fr), j = 0;
+        fseek(fr, 0, SEEK_SET);
+        while ( j < res)
+        {   
+            c = getc(fr);
+            fputc(c, fw);
+            j++;
+        }
+        fclose(fr);
+        // Remove part file
+        int del = remove(file_out.c_str());
+        if (!del)
+            printf("Deleted successful!\n");
+        else 
+            printf("Not deleted\n");
+    }
+    fclose(fw);
+}
+
 int main(int argc, char *argv[])
 {
- 
   	if(argc < 2) {
     	printf("Usage: %s <URL>\n", argv[0]);
     	return 1;
   	}
-  	struct link_argv handle;
-  	parse_argv(argv, argc, handle);
+  	parse_argv(argv, argc);
   	pthread_t tid[NUMT];
 
-  	if (handle.thread > NUMT)
-  		handle.thread = NUMT;
+  	if (url_info.thread > NUMT || url_info.thread < 1)
+  		url_info.thread = 4; /*if wrong set thread = 4*/
 
-  	if (handle.thread > handle.conn)
-  		handle.thread = handle.conn;
+  	if (url_info.thread > url_info.conn)
+  		url_info.thread = url_info.conn;
 
   	/* Must initialize libcurl before any threads are started */ 
   	curl_global_init(CURL_GLOBAL_ALL);
@@ -227,67 +450,65 @@ int main(int argc, char *argv[])
   	curl = curl_easy_init();
   	
   	/* set URL to get here  */
-  	curl_easy_setopt(curl, CURLOPT_URL, handle.url);
+  	curl_easy_setopt(curl, CURLOPT_URL, url_info.url);
  
   	curl_easy_setopt(curl, CURLOPT_HEADER, 1);
 	curl_easy_setopt(curl, CURLOPT_NOBODY, 1);
-	curl_off_t cl;
+	
  	curl_easy_perform(curl);	
-   	res = curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl);
+   	res = curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &url_info.content_len);
   	if(!res) {
-  		printf("Download size: %" CURL_FORMAT_CURL_OFF_T "\n", cl);
+  		printf("Download size1: %" CURL_FORMAT_CURL_OFF_T "\n", url_info.content_len);
    	}
   	curl_easy_cleanup(curl);
+    if (url_info.content_len == -1) /* Don't support separate file*/
+        url_info.thread = url_info.conn = 1;
 
-  	/* create sparse file*/
-  	std::ofstream ofs(handle.out, std::ios::binary | std::ios::out);
-    ofs.seekp(cl - 1);
-    ofs.write("", 1);
-    ofs.close();
+    url_info.can_Resume = support_Resume();
 
-  	struct link_argv *pair = (struct link_argv*)malloc(handle.thread*sizeof(struct link_argv));
-  	
-  	//struct argv_download *url_range = (struct argv_download*)malloc(handle.thread*sizeof(struct argv_download));
+  	struct url_argv *tuple = (struct url_argv*)malloc(url_info.thread*sizeof(struct url_argv));
 
-  	for(int i = 0; i < handle.thread; i++) {
-  		pair[i].url = handle.url;
-  		pair[i].thread = handle.thread;
-  		pair[i].conn = handle.conn;
-  		pair[i].out = handle.out;
-  		int first = (handle.conn % handle.thread) > i ? 1: 0 ;
-  		pair[i].number = handle.conn / handle.thread + first; // Keep nuber conn thread control
+  	for(int i = 0; i < url_info.thread; i++) {
+      tuple[i].part = i;
+  		int first = (url_info.conn % url_info.thread) > i ? 1: 0 ;
+  		tuple[i].num = url_info.conn / url_info.thread + first; // Keep nuber conn thread control
   		int position = 0;
   		if (first == 1)
-  			position = (handle.conn / handle.thread + 1) * i;
+  			position = (url_info.conn / url_info.thread + 1) * i;
   		else 
-  			position = handle.conn - (handle.thread - i)*(handle.conn/handle.thread);
-  		long start = cl / handle.conn * position;
-  		long end = start + (cl / handle.conn)*pair[i].number - 1;
-  		if (i == handle.thread - 1)
-  			end = cl -1;
+  			position = url_info.conn - (url_info.thread - i)*(url_info.conn/url_info.thread);
+  		long start = url_info.content_len / url_info.conn * position;
+  		long end = start + (url_info.content_len / url_info.conn)*tuple[i].num - 1;
+  		if (i == url_info.thread - 1)
+  			end = url_info.content_len -1;
   		string temp = std::to_string(start)+'-'+std::to_string(end); 
-  		pair[i].range = new char[temp.length() + 1];
-		strcpy(pair[i].range, temp.c_str());
+  		tuple[i].range = new char[temp.length() + 1];
+		strcpy(tuple[i].range, temp.c_str());
 		int error = pthread_create(&tid[i],
                                NULL, /* default attributes please */ 
                                download_file,
-                               (void *)&pair[i]);
+                               (void *)&tuple[i]);
     if(0 != error)
       	fprintf(stderr, "Couldn't run thread number %d, errno %d\n", i, error);
     else
-      	fprintf(stderr, "Thread %d, gets %s\n", i, pair[i].url);
+      	fprintf(stderr, "Thread %d, gets %s\n", i, url_info.url);
   	}
 
    	/* now wait for all threads to terminate */ 
-  	for(int i = 0; i < handle.thread; i++) {
+  	for(int i = 0; i < url_info.thread; i++) {
     	pthread_join(tid[i], NULL);
     	fprintf(stderr, "Thread %d terminated\n", i);
   	}
   	curl_global_cleanup();
-  	for(int i = 0; i < handle.thread; i++) {
-  		delete[] pair[i].range;}
-  	free(pair);
- 	delete[] handle.url;
- 	delete[] handle.out;
-	return 0;
+    url_info.conn  = 0;
+  	for(int i = 0; i < url_info.thread; i++) {
+  		  delete[] tuple[i].range;
+        /*Calculate conn again*/
+        url_info.conn += tuple[i].num;
+    }
+    connect_file();
+  	free(tuple);
+    delete[] url_info.url;
+ 	  delete[] url_info.out;
+    return 0;
 }
