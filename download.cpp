@@ -461,10 +461,10 @@ int main(int argc, char *argv[])
   		printf("Download size1: %" CURL_FORMAT_CURL_OFF_T "\n", url_info.content_len);
    	}
   	curl_easy_cleanup(curl);
-    if (url_info.content_len == -1) /* Don't support separate file*/
-        url_info.thread = url_info.conn = 1;
 
     url_info.can_Resume = support_Resume();
+    if (url_info.content_len == -1 || url_info.can_Resume == false) /* Don't support separate file*/
+        url_info.thread = url_info.conn = 1;
 
   	struct url_argv *tuple = (struct url_argv*)malloc(url_info.thread*sizeof(struct url_argv));
 
